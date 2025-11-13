@@ -1,2 +1,10 @@
+# Dependencias principales para Pygame
 pygame
-python-dotenv
+
+# Dependencias para la IA y Deep Learning
+tensorflow
+numpy
+
+# Opcional: Para asegurar que Pillow esté disponible (a veces necesario 
+# indirectamente por otras librerías de IA)
+Pillow

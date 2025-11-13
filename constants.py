@@ -2,11 +2,14 @@
 
 ALTO = 200
 ANCHO = 200
-SIZE = 10 # Tamaño de cada bloque de la serpiente/manzana
-FPS = 10 # Velocidad inicial del juego (Frames per second)
+SIZE = 10  # Block size for snake/apple
+FPS = 10   # Initial game speed (Frames per second)
 
-# Colores (R, G, B)
+# Colors (R, G, B)
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
-GREEN = (0, 255, 0) # Serpiente
-RED = (255, 0, 0)   # Manzana
+GREEN = (0, 255, 0)  # Snake
+RED = (255, 0, 0)    # Apple
+BLUE = (0, 100, 255) # Snake head (optional visualization)
+
+
