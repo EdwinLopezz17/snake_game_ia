@@ -1,27 +1,25 @@
-#game.py
 import pygame
 from pygame.math import Vector2
+from collections import deque
 import numpy as np
 
 from snake import Snake
 from apple import Apple
 from dqn_agent import DQNAgent
+from metrics_tracker import MetricsTracker
 
 from constants import ANCHO, ALTO, SIZE, RED, GREEN, BLACK, WHITE, FPS
 
-# Rewards for the agent
 REWARD_EAT = 10
-REWARD_MOVE_CLOSER = 0.2
-REWARD_MOVE_AWAY = -0.15
+REWARD_MOVE_CLOSER = 1.0
+REWARD_MOVE_AWAY = -0.5
 REWARD_DEATH = -10
-REWARD_LOOP = -5  # Penalty for going in circles
+REWARD_LOOP = -5
+REWARD_DANGER_ZONE = -2.0
+REWARD_ESCAPE_ROUTE = 0.3
+REWARD_NO_PATH = -8
+# ============================================================================
 
-# STATE SIZE: Enhanced spatial awareness
-# 8 (danger in 8 directions) + 
-# 8 (body parts in 8 directions, 2 steps away) + 
-# 4 (current direction) + 
-# 4 (apple location) + 
-# 4 (snake info: length, body density, wall proximity, tail accessible)
 STATE_SIZE = 28
 ACTION_SIZE = 4
 
@@ -32,7 +30,7 @@ class Game:
         self.is_ai_mode = is_ai_mode
         
         self.WIN = pygame.display.set_mode((ANCHO, ALTO))
-        pygame.display.set_caption("Snake AI V2 - Enhanced Spatial Vision")
+        pygame.display.set_caption("Snake AI V2.1 - Improved Spatial Planning")
 
         self.SCORE_TEXT = pygame.font.SysFont("Russo One", 12)
         self.TITLE_FONT = pygame.font.SysFont("Russo One", 30)
@@ -42,6 +40,7 @@ class Game:
 
         if self.is_ai_mode:
             self.agent = DQNAgent(STATE_SIZE, ACTION_SIZE)
+            self.metrics = MetricsTracker()
         
         self._init_elements()
         
@@ -50,8 +49,9 @@ class Game:
         self.max_score = 0
         self.save_frequency = 2
         
-        # Track recent positions to detect loops
         self.recent_positions = []
+        self.metrics_save_frequency = 10
+        self._trapped_this_episode = False
 
     def _init_elements(self):
         """Initialize game elements."""
@@ -62,6 +62,7 @@ class Game:
         self.frame_iteration = 0
         self.prev_distance = self._get_distance_to_apple()
         self.recent_positions = []
+        self._trapped_this_episode = False
 
     def _get_distance_to_apple(self):
         head = self.snake.body[0]
@@ -78,7 +79,8 @@ class Game:
         if self.is_ai_mode:
             info_lines = [
                 f"Episode: {self.episode_count} | Score: {self.score} | Max: {self.max_score}",
-                f"Length: {len(self.snake.body)} | Epsilon: {self.agent.epsilon:.3f}"
+                f"Length: {len(self.snake.body)} | Epsilon: {self.agent.epsilon:.3f}",
+                f"Steps: {self.frame_iteration} | Apples: {self.metrics.episode_data['apples_eaten']}"
             ]
             
             for i, line in enumerate(info_lines):
@@ -110,10 +112,8 @@ class Game:
         Check if a point would cause collision.
         Returns: 1 if collision, 0 if safe
         """
-        # Wall collision
         if point.x < 0 or point.x >= ANCHO or point.y < 0 or point.y >= ALTO:
             return 1
-        # Body collision (skip head)
         if point in self.snake.body[1:]:
             return 1
         return 0
@@ -129,23 +129,10 @@ class Game:
             if distance <= max_distance * SIZE:
                 count += 1
         
-        # Normalize by snake length
         return min(count / max(len(self.snake.body) - 1, 1), 1.0)
 
     def _get_state(self):
-        """
-        Generate enhanced state vector (28 values) for Neural Network.
-        
-        State breakdown:
-        [0-7]:   Immediate danger in 8 directions (N, NE, E, SE, S, SW, W, NW)
-        [8-15]:  Body density in 8 directions (how many body parts nearby)
-        [16-19]: Current direction (L, R, U, D)
-        [20-23]: Apple location (L, R, U, D)
-        [24]:    Normalized snake length (0-1)
-        [25]:    Body density around head (how trapped we are)
-        [26]:    Distance to nearest wall (normalized)
-        [27]:    Can reach tail (escape route available)
-        """
+
         head = self.snake.body[0]
         
         dir_l = self.snake.direction_left
@@ -153,7 +140,6 @@ class Game:
         dir_u = self.snake.direction_up
         dir_d = self.snake.direction_down
         
-        # 8 directions: N, NE, E, SE, S, SW, W, NW
         directions_8 = [
             Vector2(0, -SIZE),           # N (0)
             Vector2(SIZE, -SIZE),        # NE (1)
@@ -211,20 +197,18 @@ class Game:
         
         # [26] Distance to nearest wall (normalized 0-1)
         dist_to_walls = [
-            head.x / ANCHO,                    # From left
-            (ANCHO - head.x) / ANCHO,         # From right
-            head.y / ALTO,                     # From top
-            (ALTO - head.y) / ALTO            # From bottom
+            head.x / ANCHO,
+            (ANCHO - head.x) / ANCHO,
+            head.y / ALTO,
+            (ALTO - head.y) / ALTO
         ]
         min_wall_distance = min(dist_to_walls)
         
-        # [27] Can reach tail? (Check if path to tail is relatively clear)
+        # [27] Can reach tail?
         tail = self.snake.body[-1]
         manhattan_to_tail = abs(head.x - tail.x) + abs(head.y - tail.y)
-        # Normalize by snake length - if close relative to length, it's accessible
         tail_accessible = 1.0 if manhattan_to_tail <= len(self.snake.body) * SIZE * 0.5 else 0.0
         
-        # Combine all state components
         state = (
             danger_8_dirs +              # [0-7]
             body_density_8_dirs +        # [8-15]
@@ -239,22 +223,150 @@ class Game:
         return np.array(state, dtype=np.float32)
 
     def _is_looping(self):
-        """Detect if snake is going in circles."""
-        if len(self.recent_positions) < 8:
+        """
+        🔥 MEJORADO: Detecta loops más temprano
+        Reduce de 8 a 6 posiciones para detectar problemas antes
+        """
+        if len(self.recent_positions) < 6:  # Era 8
             return False
         
-        # Check if we've been to the same position recently
         head_pos = (self.snake.body[0].x, self.snake.body[0].y)
         return self.recent_positions.count(head_pos) > 2
 
+    def _get_path_length_to_tail(self):
+        """
+        Calcula la longitud del camino más corto (BFS) desde la cabeza hasta la cola.
+        Retorna la longitud del camino (en bloques) o infinito si no hay camino.
+        """
+        head = self.snake.body[0]
+        target = self.snake.body[-1]  # La cola es el objetivo
+
+        if head == target:
+            return 0
+
+        # Posiciones ocupadas por el cuerpo (excluyendo la cola)
+        occupied = {(block.x, block.y) for block in self.snake.body[:-1]}
+
+        # BFS setup: (x, y, distance)
+        queue = deque([(head.x, head.y, 0)])
+        visited = {(head.x, head.y)}
+
+        directions = [
+            (0, -SIZE),
+            (0, SIZE),
+            (-SIZE, 0),
+            (SIZE, 0)
+        ]
+
+        # BFS algorithm
+        while queue:
+            current_x, current_y, dist = queue.popleft()
+
+            for dx, dy in directions:
+                next_x = current_x + dx
+                next_y = current_y + dy
+                next_pos_tuple = (next_x, next_y)
+
+                # 1. Validar límites
+                if next_x < 0 or next_x >= ANCHO or next_y < 0 or next_y >= ALTO:
+                    continue
+
+                # 2. Validar colisión con el cuerpo *ocupado* (no la cola)
+                if next_pos_tuple in occupied:
+                    continue
+
+                # 3. Validar no visitado
+                if next_pos_tuple in visited:
+                    continue
+
+                # 4. ¡Encontramos la cola!
+                if next_x == target.x and next_y == target.y:
+                    return dist + 1  # Distancia de la cabeza al objetivo (en pasos)
+
+                # Marcar como visitado y agregar a la cola
+                visited.add(next_pos_tuple)
+                queue.append((next_x, next_y, dist + 1))
+
+        # No se encontró ningún camino
+        return float('inf')
+    
+
+    def _has_path_to_apple(self):
+        head = self.snake.body[0]
+        target = self.apple.pos
+        
+        if head == target:
+            self._trapped_this_episode = False
+            return True
+        
+        occupied = {(block.x, block.y) for block in self.snake.body[:-1]}
+        
+        # BFS setup
+        # ### MODIFICADO: Agregamos un tercer valor '0' que representa los pasos dados (distancia)
+        queue = deque([(head.x, head.y, 0)])
+        visited = {(head.x, head.y)}
+        
+        directions = [
+            (0, -SIZE), 
+            (0, SIZE),  
+            (-SIZE, 0),
+            (SIZE, 0)
+        ]
+        
+        while queue:
+            # ### MODIFICADO: Desempaquetamos ahora 3 valores
+            current_x, current_y, dist = queue.popleft()
+            
+            # ### NUEVO: Si ya hemos caminado más de 20 pasos, consideramos que hay salida
+            if dist > 20:
+                self._trapped_this_episode = False
+                return True
+            
+            for dx, dy in directions:
+                next_x = current_x + dx
+                next_y = current_y + dy
+                
+                if next_x < 0 or next_x >= ANCHO or next_y < 0 or next_y >= ALTO:
+                    continue
+                
+                if (next_x, next_y) in occupied:
+                    continue
+                
+                if (next_x, next_y) in visited:
+                    continue
+                
+                if next_x == target.x and next_y == target.y:
+                    self._trapped_this_episode = False
+                    return True
+                
+                visited.add((next_x, next_y))
+                # ### MODIFICADO: Agregamos el vecino con la distancia + 1
+                queue.append((next_x, next_y, dist + 1))
+        
+        print("Esta encerrada")
+        return False
+
+    def _determine_death_type(self):
+        """
+        Determine the type of death that occurred.
+        Returns: 'wall', 'self', or 'timeout'
+        """
+        head = self.snake.body[0]
+        
+        if (head.x < 0 or head.x >= ANCHO or head.y < 0 or head.y >= ALTO):
+            return 'wall'
+        
+        for block in self.snake.body[1:]:
+            if head == block:
+                return 'self'
+        
+        return 'timeout'
+
     def _update_game_state(self, action=None):
-        """
-        Update game logic with enhanced reward shaping.
-        """
+
         self.snake.can_change_direction = True
         prev_distance = self.prev_distance
         
-        # Execute action if in AI mode
         if self.is_ai_mode and action is not None:
             move_map = {
                 0: self.snake.move_up,
@@ -264,10 +376,17 @@ class Game:
             }
             move_map[action]()
         
+        next_point = Vector2(
+            self.snake.body[0].x + self.snake.direction.x, 
+            self.snake.body[0].y + self.snake.direction.y
+        )
+        
         self.snake.move()
         self.frame_iteration += 1
         
-        # Track position for loop detection
+        if self.is_ai_mode:
+            self.metrics.record_step()
+        
         head_pos = (self.snake.body[0].x, self.snake.body[0].y)
         self.recent_positions.append(head_pos)
         if len(self.recent_positions) > 10:
@@ -276,11 +395,22 @@ class Game:
         game_over = False
         reward = 0
         
-        # Check death
+        # Check death PRIMERO (colisión física real)
         if self.snake.die():
             game_over = True
             self.game_active = False
             reward = REWARD_DEATH
+            
+            if self.is_ai_mode:
+                death_type = self._determine_death_type()
+                self.metrics.record_death(
+                    death_type=death_type,
+                    snake_body=self.snake.body,
+                    board_width=ANCHO,
+                    board_height=ALTO,
+                    size=SIZE
+                )
+            
             return reward, game_over
         
         # Check apple eaten
@@ -290,26 +420,82 @@ class Game:
             self.apple.generate(self.snake)
             reward = REWARD_EAT
             self.prev_distance = self._get_distance_to_apple()
-            self.recent_positions = []  # Reset loop detection
+            self.recent_positions = []
+            
+            if self.is_ai_mode:
+                self.metrics.record_apple()
         else:
-            # Reward shaping: encourage moving towards apple
+            # ============================================================
+            # 🔥 SISTEMA DE REWARDS MEJORADO
+            # ============================================================
             current_distance = self._get_distance_to_apple()
+            
+            # 1. Reward base por dirección hacia la manzana
             if current_distance < prev_distance:
                 reward = REWARD_MOVE_CLOSER
             else:
                 reward = REWARD_MOVE_AWAY
+
+            if reward == REWARD_MOVE_AWAY:
+                # Obtenemos la longitud real del camino más corto a la cola
+                path_to_tail_len = self._get_path_length_to_tail()
+                snake_len = len(self.snake.body)
+                
+                # Definimos un umbral: ¿Es un camino corto y útil? 
+                # e.g., menos de la mitad de la longitud total, o un valor fijo (ej. 10)
+                TAIL_PATH_THRESHOLD = max(5, snake_len // 2)
+                
+                if path_to_tail_len <= TAIL_PATH_THRESHOLD:
+                    # El movimiento de "alejarse" se compensa porque asegura la ruta de escape.
+                    reward += REWARD_ESCAPE_ROUTE  # (0.3)
+            
+            # ============================================================
+            # 🔥 VALIDACIÓN DE CAMINO: Solo penaliza, NO termina el juego
+            # ============================================================
+            if not self._has_path_to_apple() and not self._trapped_this_episode:
+                reward += REWARD_NO_PATH
+                self._trapped_this_episode = True
+            # ============================================================
+            
+            # 3. Penalización por entrar a zona peligrosa
+            new_head = self.snake.body[0]
+            body_count_around = 0
+            for dx in [-SIZE, 0, SIZE]:
+                for dy in [-SIZE, 0, SIZE]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    check_point = Vector2(new_head.x + dx, new_head.y + dy)
+                    if check_point in self.snake.body[1:]:
+                        body_count_around += 1
+            
+            body_density = body_count_around / 8
+            
+            if body_density > 0.5:
+                reward += REWARD_DANGER_ZONE
+            
+            
             self.prev_distance = current_distance
             
-            # Penalty for looping
+            # 5. Penalización por loops
             if self._is_looping():
                 reward += REWARD_LOOP
+            # ============================================================
         
-        # Timeout penalty (scale with snake length)
+        # Timeout penalty
         max_moves = 100 * len(self.snake.body)
         if self.frame_iteration > max_moves:
             game_over = True
             self.game_active = False
             reward = REWARD_DEATH
+            
+            if self.is_ai_mode:
+                self.metrics.record_death(
+                    death_type='timeout',
+                    snake_body=self.snake.body,
+                    board_width=ANCHO,
+                    board_height=ALTO,
+                    size=SIZE
+                )
             
         return reward, game_over
 
@@ -349,6 +535,7 @@ class Game:
                     if event.key == pygame.K_ESCAPE or event.key == pygame.K_q:
                         if self.is_ai_mode:
                             self.agent.save_model()
+                            self.metrics.save_metrics()
                         self._quit_game()
         return "QUIT"
 
@@ -356,6 +543,10 @@ class Game:
         """Quit game properly."""
         if self.is_ai_mode:
             self.agent.save_model()
+            self.metrics.save_metrics()
+            print("\n" + "="*65)
+            self.metrics.print_summary()
+            print("="*65)
         pygame.quit()
         quit()
 
@@ -363,51 +554,56 @@ class Game:
         """Main game loop with continuous AI training."""
         running = True
         
-        print("\n" + "="*60)
-        print("🐍 SNAKE AI V2 - Enhanced Spatial Awareness Training")
-        print("="*60)
+        print("\n" + "="*70)
+        print("🐍 SNAKE AI V2.1 - IMPROVED SPATIAL PLANNING & REWARDS")
+        print("="*70)
         print(f"📊 State Size: {STATE_SIZE} features")
         print(f"🎮 Actions: {ACTION_SIZE} (Up, Down, Left, Right)")
-        print(f"🧠 Model: Deep Q-Network with spatial body tracking")
+        print(f"🧠 Model: Deep Q-Network (loading existing model)")
         print(f"💾 Saves: Every {self.save_frequency} episodes")
-        print("="*60 + "\n")
+        print(f"📈 Metrics: Tracking {self.metrics_save_frequency} episode intervals")
+        print("="*70 + "\n")
         
         while running:
             self._init_elements()
             self.episode_count += 1
             
-            # Active game loop
+            if self.is_ai_mode:
+                self.metrics.start_episode()
+            
             while self.game_active:
-                # Check for quit events
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         if self.is_ai_mode:
                             self.agent.save_model()
+                            self.metrics.save_metrics()
+                            self.metrics.print_summary()
                         self._quit_game()
                     if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                         if self.is_ai_mode:
                             self.agent.save_model()
+                            self.metrics.save_metrics()
+                            self.metrics.print_summary()
                         self._quit_game()
                 
-                # Adjust FPS based on training progress
                 if self.is_ai_mode:
                     if self.agent.epsilon < 0.1:
-                        self.fps_clock.tick(FPS * 30)  # Very fast when trained
+                        self.fps_clock.tick(FPS * 30)
                     elif self.agent.epsilon < 0.5:
-                        self.fps_clock.tick(FPS * 10)  # Fast
+                        self.fps_clock.tick(FPS * 10)
                     else:
-                        self.fps_clock.tick(FPS * 5)   # Medium during early training
+                        self.fps_clock.tick(FPS * 5)
                 else:
                     self.fps_clock.tick(FPS)
 
                 if self.is_ai_mode:
-                    # AI logic
                     old_state = self._get_state()
                     action = self.agent.act(old_state)
                     
                     reward, done = self._update_game_state(action)
                     new_state = self._get_state()
                     
+                    # 🔥 ACTIVAR ESTAS LÍNEAS PARA ENTRENAR
                     self.agent.remember(old_state, action, reward, new_state, done)
                     self.agent.replay()
                     
@@ -426,28 +622,29 @@ class Game:
                               f"Avg: {avg_score:5.1f} | "
                               f"ε: {self.agent.epsilon:.3f}")
                 else:
-                    # Human logic
                     self._handle_input()
                     self._update_game_state(action=None)
                 
                 self._draw_elements()
 
-            # Save model periodically
             if self.is_ai_mode and self.episode_count % self.save_frequency == 0:
                 self.agent.save_model()
                 print(f"\n{'='*60}")
                 print(f"📈 Checkpoint: {self.episode_count} episodes completed")
                 print(f"🏆 Best Score: {self.max_score} | Avg: {self.total_score/self.episode_count:.1f}")
                 print(f"{'='*60}\n")
+            
+            if self.is_ai_mode and self.episode_count % self.metrics_save_frequency == 0:
+                self.metrics.save_metrics()
+                print("\n")
+                self.metrics.print_summary()
                 
-            # In human mode, show game over screen
             if not self.is_ai_mode:
                 action = self._game_over_screen()
                 if action == "RESTART":
                     continue
                 else:
                     running = False
-            # In AI mode, automatically restart for continuous training
 
 if __name__ == '__main__':
     game = Game(is_ai_mode=True)

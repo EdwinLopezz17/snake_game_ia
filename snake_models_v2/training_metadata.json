@@ -1,7 +1,7 @@
 {
-  "epsilon": 0.01,
-  "total_episodes": 114,
-  "total_steps": 8481,
+  "epsilon": 0.00998645168764533,
+  "total_episodes": 260,
+  "total_steps": 19969,
   "epsilon_min": 0.01,
   "epsilon_decay": 0.995,
   "gamma": 0.95,

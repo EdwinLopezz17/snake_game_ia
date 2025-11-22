@@ -15,8 +15,13 @@ class Snake:
         self.add = False
     
     def draw(self, pygame, WIN):
-        for block in self.body:
-            pygame.draw.rect(WIN,GREEN,(block.x,block.y,SIZE,SIZE))
+        head_block = self.body[0]
+        head_color = (200, 255, 200)
+        
+        pygame.draw.rect(WIN, head_color, (head_block.x, head_block.y, SIZE, SIZE))
+
+        for block in self.body[1:]:
+            pygame.draw.rect(WIN, GREEN, (block.x, block.y, SIZE, SIZE))
 
     def move(self):
         head = self.body[0] + self.direction
